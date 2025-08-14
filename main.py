@@ -3,7 +3,8 @@ import time
 import threading
 import logging
 import os
-from datetime import timezone
+import pytz
+from datetime import datetime
 import requests
 import pandas as pd
 import yfinance as yf
@@ -15,8 +16,8 @@ from flask import Flask
 TELEGRAM_TOKEN = "8021318198:AAExTUdHDFZS5fKSsNABOmWaV8DLffZxNFo"
 TELEGRAM_CHAT_ID = 5930379340
 TIMEFRAME = "15m"
-POLL_INTERVAL = 910  # slightly more than 15 min
-SYMBOL = "^NSEI"
+SYMBOL = "^NSEI"  # NIFTY 50 Index
+IST = pytz.timezone("Asia/Kolkata")
 
 # -------------------------
 # Logging
@@ -29,6 +30,9 @@ logging.basicConfig(
 
 TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
+# -------------------------
+# Telegram Helper
+# -------------------------
 def send_telegram_message(text):
     try:
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
@@ -39,7 +43,7 @@ def send_telegram_message(text):
         logging.exception("Failed to send Telegram message: %s", e)
 
 # -------------------------
-# Candlestick Features
+# Candle Features
 # -------------------------
 def add_candle_features(df):
     df = df.copy()
@@ -66,8 +70,8 @@ def add_candle_features(df):
 # -------------------------
 def detect_patterns(df):
     patterns = []
-    last = df.iloc[-1]
-    prev = df.iloc[-2] if len(df) >= 2 else last
+    last = df.iloc[-1]      # latest fully closed candle
+    prev = df.iloc[-2]      # one before that
 
     if last['lower_wick_ratio'] >= 0.6 and last['upper_wick_ratio'] <= 0.2 and last['body_ratio'] <= 0.35:
         patterns.append("Hammer (bullish)")
@@ -109,38 +113,53 @@ def fetch_recent_candles(symbol=SYMBOL, period="60d", interval=TIMEFRAME):
     if df.empty:
         logging.warning("yfinance returned empty dataframe for %s", symbol)
         return df
-    df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Volume":"volume"})
+    df = df.rename(columns={"Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
     if df.index.tz is None:
         df.index = df.index.tz_localize('UTC')
     return df
 
 # -------------------------
-# Bot Loop (Runs in Thread)
+# Wait for Next Candle Close
+# -------------------------
+def wait_until_next_candle(interval_minutes):
+    now = datetime.now(IST)
+    minute = (now.minute // interval_minutes + 1) * interval_minutes
+    if minute >= 60:
+        next_candle_time = now.replace(hour=(now.hour + 1) % 24, minute=0, second=5, microsecond=0)
+    else:
+        next_candle_time = now.replace(minute=minute, second=5, microsecond=0)
+    sleep_time = (next_candle_time - now).total_seconds()
+    logging.info(f"Sleeping {sleep_time:.1f}s until next candle close at {next_candle_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    time.sleep(sleep_time)
+
+# -------------------------
+# Bot Loop
 # -------------------------
 def bot_loop():
     logging.info("Starting NIFTY 15-min pattern detector")
     last_alerted_idx = None
 
     while True:
+        wait_until_next_candle(15)
+
         try:
             df = fetch_recent_candles()
-            if df.empty or len(df) < 2:
-                time.sleep(POLL_INTERVAL)
+            if df.empty or len(df) < 3:  # need at least 3 for engulfing
                 continue
 
             df = add_candle_features(df)
-            last_idx = df.index[-1]
 
+            # Use second-last candle to ensure it's fully closed
+            last_idx = df.index[-2]
             if last_alerted_idx == last_idx:
-                time.sleep(POLL_INTERVAL)
                 continue
 
-            patterns = detect_patterns(df)
+            patterns = detect_patterns(df.iloc[:-1])  # exclude last forming candle
             signal = determine_signal(patterns)
 
             if patterns:
-                last_candle = df.iloc[-1]
-                time_str = last_idx.strftime("%Y-%m-%d %H:%M:%S UTC")
+                last_candle = df.iloc[-2]
+                time_str = last_idx.tz_convert(IST).strftime("%Y-%m-%d %H:%M:%S %Z")
                 perc_change = (last_candle['close'] - last_candle['open']) / last_candle['open'] * 100
                 msg = (
                     f"📊 NIFTY Pattern: {', '.join(patterns)}\n"
@@ -155,8 +174,6 @@ def bot_loop():
 
         except Exception as exc:
             logging.exception("Error in bot loop: %s", exc)
-
-        time.sleep(POLL_INTERVAL)
 
 # -------------------------
 # Flask App
